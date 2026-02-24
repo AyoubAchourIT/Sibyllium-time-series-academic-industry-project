@@ -1,0 +1,20 @@
+# Data
+datas/
+data/
+*.xlsx
+
+# Runs / artifacts
+runs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
