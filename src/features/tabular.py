@@ -87,7 +87,8 @@ def make_supervised_multi_horizon(
     lags: list[int],
     roll_windows: list[int],
     include_stats: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    return_origin_index: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series] | tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Index]:
     """Build leakage-safe X/Y matrices for multi-horizon forecasting.
 
     Returns:
@@ -128,7 +129,10 @@ def make_supervised_multi_horizon(
     x_valid = X.notna().all(axis=1) if len(X.columns) > 0 else pd.Series(True, index=df.index)
     mask = x_valid & Y.notna().all(axis=1)
 
+    origin_index = df.index[mask.to_numpy()]
     X = X.loc[mask].reset_index(drop=True)
     Y = Y.loc[mask].reset_index(drop=True)
     y0 = y0.loc[mask].reset_index(drop=True)
+    if return_origin_index:
+        return X, Y, y0, origin_index
     return X, Y, y0

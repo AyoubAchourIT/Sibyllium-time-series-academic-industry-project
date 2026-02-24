@@ -12,8 +12,15 @@ from src.data.io import find_excel_files, infer_symbol_from_path, load_excel_ohl
 from src.features.tabular import make_supervised_multi_horizon
 from src.features.technical import calculate_macd, calculate_stochastic
 from src.features.windowing import make_windows_univariate
-from src.metrics.forecast import composite_score, mean_horizon_correlation, trend_accuracy
+from src.metrics.forecast import (
+    composite_score,
+    correlation_by_horizon,
+    mean_horizon_correlation,
+    trend_accuracy,
+    trend_accuracy_by_horizon,
+)
 from src.models.baselines import drift_forecast, persistence_forecast
+from src.models.ensembles import average_ensemble
 from src.models.sklearn_models import predict_multioutput, train_multioutput_gbdt
 
 TARGET_CHOICES = (
@@ -24,6 +31,9 @@ TARGET_CHOICES = (
     "stoch_d",
     "stoch_d_smooth",
 )
+STABLE_MODELS = {"gbdt", "dlinear"}
+EXPERIMENTAL_MODELS = {"nhits", "nbeats", "tide", "ensemble_gbdt_nhits"}
+ALL_MODELS = STABLE_MODELS | EXPERIMENTAL_MODELS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,11 +47,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lookback-lags", type=int, default=64, help="Number of lag features (1..N) for GBDT")
     parser.add_argument("--delta-target", action="store_true", help="Train GBDT on target deltas (Y - y0)")
     parser.add_argument("--sweep", action="store_true", help="Run a small GBDT hyperparameter sweep")
-    parser.add_argument("--model", choices=("gbdt", "dlinear"), default="gbdt", help="Main model to train")
+    parser.add_argument("--model", default="gbdt", help="Main model to train (stable: gbdt, dlinear)")
+    parser.add_argument(
+        "--experimental-neuralforecast",
+        action="store_true",
+        help="Enable experimental NeuralForecast/ensemble models (nhits, nbeats, tide, ensemble_gbdt_nhits)",
+    )
     parser.add_argument("--lookback", type=int, default=256, help="Sequence lookback for DLinear")
     parser.add_argument("--epochs", type=int, default=20, help="Training epochs for DLinear")
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size for DLinear")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for DLinear")
+    parser.add_argument("--input-size", type=int, default=256, help="Input size for NeuralForecast models")
+    parser.add_argument("--max-steps", type=int, default=500, help="Max training steps for NeuralForecast models")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for supported models")
+    parser.add_argument("--val-size", type=int, default=120, help="Validation tail size per series for NF backtesting")
+    parser.add_argument("--step-size", type=int, default=1, help="Step size for NF rolling backtest origins")
+    parser.add_argument("--allow-small-val", action="store_true", help="Allow NF evaluation with fewer than 200 origins")
     return parser
 
 
@@ -63,10 +84,14 @@ def _roll_windows_from_lookback(lookback_lags: int) -> list[int]:
 
 def _evaluate(y_true: np.ndarray, y_pred: np.ndarray, y0: np.ndarray) -> dict[str, float]:
     corr = mean_horizon_correlation(y_true, y_pred)
+    trend_h = trend_accuracy_by_horizon(y_true, y_pred, y0)
+    corr_h = correlation_by_horizon(y_true, y_pred)
     return {
         "trend_accuracy": float(trend_accuracy(y_true, y_pred, y0)),
         "mean_correlation": float(corr),
         "composite": float(composite_score(y_true, y_pred, y0)),
+        "trend_by_horizon": [float(v) for v in trend_h],
+        "corr_by_horizon": [float(v) for v in corr_h],
     }
 
 
@@ -121,12 +146,13 @@ def _assemble_tabular_dataset_from_cache(
             continue
         assert isinstance(df, pd.DataFrame)
         try:
-            X_i, Y_i, y0_i = make_supervised_multi_horizon(
+            X_i, Y_i, y0_i, origin_idx_i = make_supervised_multi_horizon(
                 df=df,
                 target_col=target,
                 horizon=horizon,
                 lags=lags,
                 roll_windows=rw,
+                return_origin_index=True,
             )
             if X_i.empty:
                 skipped_files += 1
@@ -136,7 +162,15 @@ def _assemble_tabular_dataset_from_cache(
             y_parts.append(Y_i)
             y0_parts.append(y0_i)
             drift_parts.append(drift_forecast(y0_i.to_numpy(dtype=float), horizon=horizon))
-            meta_parts.append(pd.DataFrame({"symbol": [symbol] * len(X_i), "source_file": [path.name] * len(X_i)}))
+            meta_parts.append(
+                pd.DataFrame(
+                    {
+                        "symbol": [symbol] * len(X_i),
+                        "source_file": [path.name] * len(X_i),
+                        "origin_ds": pd.to_datetime(origin_idx_i),
+                    }
+                )
+            )
             file_summaries.append(
                 {"symbol": symbol, "file": path.name, "rows_ohlcv": int(len(df)), "rows_supervised": int(len(X_i))}
             )
@@ -227,6 +261,85 @@ def _assemble_dlinear_dataset(args: argparse.Namespace, selected_files: list[Pat
     }
 
 
+def _assemble_nhits_dataset(args: argparse.Namespace, selected_files: list[Path]) -> dict[str, object]:
+    from src.models.neuralforecast_models import build_long_df, split_long_df
+
+    per_file_series: list[tuple[str, pd.Series]] = []
+    file_summaries: list[dict[str, object]] = []
+    skipped_files = 0
+    processed_files = 0
+
+    for path in selected_files:
+        symbol = infer_symbol_from_path(path)
+        try:
+            df = _load_with_indicators(path)
+            series = df[args.target].dropna()
+            if series.empty:
+                skipped_files += 1
+                file_summaries.append({"symbol": symbol, "file": path.name, "rows_series": 0})
+                continue
+            per_file_series.append((symbol, series))
+            processed_files += 1
+            file_summaries.append(
+                {"symbol": symbol, "file": path.name, "rows_ohlcv": int(len(df)), "rows_series": int(len(series))}
+            )
+        except Exception as exc:
+            skipped_files += 1
+            file_summaries.append({"symbol": symbol, "file": path.name, "error": str(exc)})
+
+    if not per_file_series:
+        raise SystemExit("No usable target series were produced from selected files.")
+
+    full_df = build_long_df(per_file_series)
+    train_df, val_df = split_long_df(full_df, val_fraction=0.2)
+    if train_df.empty or val_df.empty:
+        raise SystemExit("NeuralForecast split produced empty train or validation data.")
+
+    return {
+        "full_df": full_df,
+        "train_df": train_df,
+        "val_df": val_df,
+        "file_summaries": file_summaries,
+        "processed_files": processed_files,
+        "skipped_files": skipped_files,
+    }
+
+
+def _drift_baseline_from_long_validation(
+    full_df: pd.DataFrame, val_df: pd.DataFrame, h: int, window: int = 10
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Build per-series drift baseline aligned to NHITS validation origin rows."""
+    full_sorted = full_df.sort_values(["unique_id", "ds"]).reset_index(drop=True)
+    val_sorted = val_df.sort_values(["unique_id", "ds"]).reset_index(drop=True)
+    preds: list[np.ndarray] = []
+    meta_rows: list[dict[str, object]] = []
+
+    for uid, g_val in val_sorted.groupby("unique_id", sort=False):
+        g_val = g_val.sort_values("ds").reset_index(drop=True)
+        if len(g_val) < h:
+            continue
+        first_val_ds = pd.to_datetime(g_val.loc[0, "ds"])
+        g_full = full_sorted[full_sorted["unique_id"] == uid].sort_values("ds").reset_index(drop=True)
+        hist = g_full[pd.to_datetime(g_full["ds"]) < first_val_ds].reset_index(drop=True)
+        if hist.empty:
+            continue
+        y_t = float(hist.iloc[-1]["y"])
+        if len(hist) > window:
+            y_prev = float(hist.iloc[-(window + 1)]["y"])
+            slope = (y_t - y_prev) / float(window)
+        else:
+            slope = 0.0
+        steps = np.arange(1, h + 1, dtype=float)
+        preds.append(y_t + slope * steps)
+        meta_rows.append(
+            {"symbol": str(uid), "source_file": str(uid), "origin_ds": pd.to_datetime(hist.iloc[-1]["ds"])}
+        )
+
+    if not preds:
+        return np.empty((0, h), dtype=float), pd.DataFrame(columns=["symbol", "source_file", "origin_ds"])
+    return np.vstack(preds).astype(float, copy=False), pd.DataFrame(meta_rows)
+
+
 def _run_gbdt_experiment(
     ds: dict[str, object],
     *,
@@ -282,17 +395,49 @@ def _run_gbdt_experiment(
         "split_idx": split_idx,
         "n_rows": n_rows,
         "n_features": int(X_train.shape[1]),
+        "models": models,
+        "delta_target": bool(delta_target),
     }
+
+
+def _horizon_band_mean(values: list[float], start_k: int, end_k: int) -> float:
+    if not values:
+        return 0.0
+    start = max(1, start_k)
+    end = min(len(values), end_k)
+    if start > end:
+        return 0.0
+    arr = np.asarray(values[start - 1 : end], dtype=float)
+    return float(arr.mean()) if arr.size else 0.0
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    args.model = str(args.model).lower()
+    if args.model not in ALL_MODELS:
+        raise SystemExit(
+            f"Unsupported --model '{args.model}'. Stable models: gbdt, dlinear. "
+            "Experimental: nhits, nbeats, tide, ensemble_gbdt_nhits (requires --experimental-neuralforecast)."
+        )
+    if args.model in EXPERIMENTAL_MODELS and not args.experimental_neuralforecast:
+        raise SystemExit(
+            f"Model '{args.model}' is experimental and disabled by default. "
+            "Re-run with --experimental-neuralforecast to enable it."
+        )
     if args.horizon < 1:
         raise SystemExit("--horizon must be >= 1")
     if args.lookback_lags < 1:
         raise SystemExit("--lookback-lags must be >= 1")
     if args.lookback < 1:
         raise SystemExit("--lookback must be >= 1")
+    if args.input_size < 1:
+        raise SystemExit("--input-size must be >= 1")
+    if args.max_steps < 1:
+        raise SystemExit("--max-steps must be >= 1")
+    if args.val_size < args.horizon:
+        raise SystemExit("--val-size must be >= --horizon")
+    if args.step_size < 1:
+        raise SystemExit("--step-size must be >= 1")
 
     selected_files = _select_files(args.data_dir, args.limit_files, args.symbol_pattern)
     if not selected_files:
@@ -382,7 +527,7 @@ def main() -> int:
         drift_all = ds["drift_pred"]
         meta_all = ds["meta"]
         n_rows = len(X_all)
-    else:
+    elif args.model == "dlinear":
         ds = _assemble_dlinear_dataset(args, selected_files)
         X_all = ds["X"]
         Y_all = ds["Y"]
@@ -390,6 +535,17 @@ def main() -> int:
         drift_all = ds["drift_pred"]
         meta_all = ds["meta"]
         n_rows = int(X_all.shape[0])
+    elif args.model in {"nhits", "nbeats", "tide"}:
+        ds = _assemble_nhits_dataset(args, selected_files)
+        full_df = ds["full_df"]
+        train_df = ds["train_df"]
+        val_df = ds["val_df"]
+        n_rows = int(len(full_df))
+    else:
+        # Ensemble path needs both tabular and NeuralForecast datasets.
+        ds_tab = _assemble_tabular_dataset(args, selected_files)
+        ds_nh = _assemble_nhits_dataset(args, selected_files)
+        n_rows = int(len(ds_tab["X"]))
 
     if args.model == "gbdt":
         result = _run_gbdt_experiment(ds, horizon=args.horizon, delta_target=bool(args.delta_target))
@@ -407,7 +563,7 @@ def main() -> int:
         if pred_model_delta is not None:
             np.save(run_dir / "predictions_val_gbdt_delta.npy", pred_model_delta)
         n_features = int(result["n_features"])
-    else:
+    elif args.model == "dlinear":
         if n_rows < 2:
             raise SystemExit("Need at least 2 rows/windows to create train/validation split.")
         split_idx = max(1, min(n_rows - 1, int(n_rows * 0.8)))
@@ -440,13 +596,170 @@ def main() -> int:
         np.save(run_dir / "predictions_val.npy", pred_model)
         np.save(run_dir / "predictions_val_dlinear.npy", pred_model)
         n_features = int(X_train.shape[1])
+    elif args.model in {"nhits", "nbeats", "tide"}:
+        try:
+            from src.models.neuralforecast_models import backtest_nf
+        except ImportError as exc:
+            raise SystemExit(
+                f"{args.model.upper()} requested but neuralforecast is not installed. Install requirements.txt first."
+            ) from exc
+        full_df = ds["full_df"]
+        try:
+            y_val_np, y0_val_np, pred_model = backtest_nf(
+                model_name=args.model,
+                df_long=full_df,
+                h=args.horizon,
+                val_size=args.val_size,
+                step_size=args.step_size,
+                input_size=args.input_size,
+                max_steps=args.max_steps,
+                seed=args.seed,
+            )
+        except ImportError as exc:
+            raise SystemExit(
+                f"{args.model.upper()} requested but neuralforecast is not installed. Install requirements.txt first."
+            ) from exc
+        if y_val_np.shape[0] == 0:
+            raise SystemExit(f"{args.model.upper()} backtest produced no aligned validation predictions.")
+        n_val = int(y_val_np.shape[0])
+        if n_val < 200 and not args.allow_small_val:
+            print(
+                f"WARNING: {args.model.upper()} backtest produced only {n_val} validation origins (<200). "
+                "Rerun with larger --val-size or pass --allow-small-val to continue."
+            )
+            raise SystemExit(1)
+        # For NF backtests with many rolling origins, use simple baselines aligned to the same y0/Y.
+        pred_persistence = persistence_forecast(y0_val_np, horizon=args.horizon)
+        pred_drift = drift_forecast(y0_val_np, horizon=args.horizon)
+        meta_val = pd.DataFrame({"symbol": ["backtest"] * len(y0_val_np), "source_file": ["backtest"] * len(y0_val_np)})
+
+        metrics = {
+            "persistence": _evaluate(y_val_np, pred_persistence, y0_val_np),
+            "drift": _evaluate(y_val_np, pred_drift, y0_val_np),
+            args.model: _evaluate(y_val_np, pred_model, y0_val_np),
+        }
+        np.save(run_dir / "predictions_val.npy", pred_model)
+        np.save(run_dir / f"predictions_val_{args.model}.npy", pred_model)
+        split_idx = int(max(0, len(full_df) - args.val_size))
+        n_rows = int(len(full_df))
+        n_features = int(args.input_size)
+    else:
+        # Ensemble = 0.5 * GBDT(delta-target) + 0.5 * NHITS on absolute scale.
+        try:
+            from src.models.neuralforecast_models import predict_nf, train_nf
+        except ImportError as exc:
+            raise SystemExit(
+                "ENSEMBLE_GBDT_NHITS requested but neuralforecast is not installed. Install requirements.txt first."
+            ) from exc
+
+        # Train GBDT with delta targets (forced) on tabular features.
+        gbdt_result = _run_gbdt_experiment(ds_tab, horizon=args.horizon, delta_target=True)
+        gbdt_models = gbdt_result["models"]
+        assert isinstance(gbdt_models, list)
+
+        # Train NHITS and get aligned validation arrays (one origin per series).
+        full_df = ds_nh["full_df"]
+        train_df = ds_nh["train_df"]
+        val_df = ds_nh["val_df"]
+        try:
+            nf = train_nf(
+                model_name="nhits",
+                train_df=train_df,
+                h=args.horizon,
+                input_size=args.input_size,
+                max_steps=args.max_steps,
+                seed=args.seed,
+            )
+        except ImportError as exc:
+            raise SystemExit(
+                "ENSEMBLE_GBDT_NHITS requested but neuralforecast is not installed. Install requirements.txt first."
+            ) from exc
+
+        y_val_np, y0_val_np, pred_nhits = predict_nf(nf, full_df=full_df, val_df=val_df, h=args.horizon)
+        if y_val_np.shape[0] == 0:
+            raise SystemExit("NHITS produced no aligned validation predictions for ensemble.")
+        pred_persistence = persistence_forecast(y0_val_np, horizon=args.horizon)
+        pred_drift, meta_val = _drift_baseline_from_long_validation(full_df, val_df, h=args.horizon)
+        if pred_drift.shape != y_val_np.shape:
+            pred_drift = persistence_forecast(y0_val_np, horizon=args.horizon)
+            meta_val = pd.DataFrame({"symbol": ["unknown"] * len(y0_val_np), "source_file": ["unknown"] * len(y0_val_np)})
+
+        # Align GBDT predictions to the same NHITS validation origins using tabular metadata.
+        tab_meta = ds_tab["meta"].copy().reset_index(drop=True)
+        assert isinstance(tab_meta, pd.DataFrame)
+        tab_meta["origin_ds"] = pd.to_datetime(tab_meta["origin_ds"])
+        nh_meta = meta_val.copy().reset_index(drop=True)
+        nh_meta["origin_ds"] = pd.to_datetime(nh_meta["origin_ds"])
+
+        idx_pairs = list(zip(tab_meta["symbol"], tab_meta["origin_ds"]))
+        pos_map = {(str(sym), pd.Timestamp(ds)): i for i, (sym, ds) in enumerate(idx_pairs)}
+        match_positions: list[int] = []
+        keep_rows: list[int] = []
+        for i, row in nh_meta.iterrows():
+            key = (str(row["symbol"]), pd.Timestamp(row["origin_ds"]))
+            pos = pos_map.get(key)
+            if pos is None:
+                continue
+            match_positions.append(pos)
+            keep_rows.append(i)
+
+        if not match_positions:
+            raise SystemExit("Could not align GBDT tabular rows to NHITS validation origins for ensemble.")
+
+        X_all_tab = ds_tab["X"]
+        Y_all_tab = ds_tab["Y"]
+        y0_all_tab = ds_tab["y0"]
+        assert isinstance(X_all_tab, pd.DataFrame)
+        assert isinstance(Y_all_tab, pd.DataFrame)
+        assert isinstance(y0_all_tab, pd.Series)
+        X_match = X_all_tab.iloc[match_positions]
+        Y_match = Y_all_tab.iloc[match_positions].to_numpy(dtype=float)
+        y0_match = y0_all_tab.iloc[match_positions].to_numpy(dtype=float)
+        pred_gbdt_delta_match = predict_multioutput(gbdt_models, X_match)
+        pred_gbdt_match = pred_gbdt_delta_match + y0_match.reshape(-1, 1)
+
+        # Keep only rows that aligned in both models.
+        y_val_np = y_val_np[keep_rows]
+        y0_val_np = y0_val_np[keep_rows]
+        pred_nhits = pred_nhits[keep_rows]
+        pred_persistence = pred_persistence[keep_rows]
+        pred_drift = pred_drift[keep_rows]
+        meta_val = nh_meta.iloc[keep_rows].reset_index(drop=True)
+
+        # Prefer the NHITS-aligned y/y0 for evaluation, but ensure shapes match.
+        if pred_gbdt_match.shape != pred_nhits.shape or pred_gbdt_match.shape != y_val_np.shape:
+            raise SystemExit("Aligned ensemble component prediction shapes do not match.")
+        # If tabular targets differ slightly from NHITS alignment due to data cleaning, keep NHITS Y/y0.
+        _ = Y_match, y0_match
+
+        pred_model = average_ensemble(pred_gbdt_match, pred_nhits, weight_a=0.5)
+        metrics = {
+            "persistence": _evaluate(y_val_np, pred_persistence, y0_val_np),
+            "drift": _evaluate(y_val_np, pred_drift, y0_val_np),
+            "gbdt": _evaluate(y_val_np, pred_gbdt_match, y0_val_np),
+            "nhits": _evaluate(y_val_np, pred_nhits, y0_val_np),
+            "ensemble_gbdt_nhits": _evaluate(y_val_np, pred_model, y0_val_np),
+        }
+        np.save(run_dir / "predictions_val.npy", pred_model)
+        np.save(run_dir / "predictions_val_gbdt.npy", pred_gbdt_match)
+        np.save(run_dir / "predictions_val_nhits.npy", pred_nhits)
+        np.save(run_dir / "predictions_val_ensemble_gbdt_nhits.npy", pred_model)
+        split_idx = int(len(train_df))
+        n_rows = int(len(train_df) + len(val_df))
+        n_features = int(ds_tab["X"].shape[1])
+        ds = {
+            "processed_files": ds_nh["processed_files"],
+            "skipped_files": ds_nh["skipped_files"],
+            "file_summaries": ds_nh["file_summaries"],
+        }
 
     np.save(run_dir / "predictions_val_persistence.npy", pred_persistence)
     np.save(run_dir / "predictions_val_drift.npy", pred_drift)
     np.save(run_dir / "y_val.npy", y_val_np)
     np.save(run_dir / "y0_val.npy", y0_val_np)
 
-    meta_val = meta_all.iloc[split_idx:].reset_index(drop=True)
+    if args.model not in {"nhits", "nbeats", "tide", "ensemble_gbdt_nhits"}:
+        meta_val = meta_all.iloc[split_idx:].reset_index(drop=True)
     model_key = args.model
     preview = pd.DataFrame(
         {
@@ -489,9 +802,19 @@ def main() -> int:
     )
     print("Metrics:")
     for name, vals in metrics.items():
+        trend_h = vals.get("trend_by_horizon", [])
+        corr_h = vals.get("corr_by_horizon", [])
+        t_near = _horizon_band_mean(trend_h, 1, 5)
+        t_far = _horizon_band_mean(trend_h, 11, 15)
+        c_near = _horizon_band_mean(corr_h, 1, 5)
+        c_far = _horizon_band_mean(corr_h, 11, 15)
         print(
             f"  {name:12s} trend={vals['trend_accuracy']:.4f} "
             f"corr={vals['mean_correlation']:.4f} composite={vals['composite']:.4f}"
+        )
+        print(
+            f"    horizons trend k1-5={t_near:.4f} k11-15={t_far:.4f} | "
+            f"corr k1-5={c_near:.4f} k11-15={c_far:.4f}"
         )
     return 0
 

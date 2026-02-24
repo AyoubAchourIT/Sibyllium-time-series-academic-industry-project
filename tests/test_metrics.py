@@ -1,6 +1,12 @@
 import numpy as np
 
-from src.metrics.forecast import composite_score, mean_horizon_correlation, trend_accuracy
+from src.metrics.forecast import (
+    composite_score,
+    correlation_by_horizon,
+    mean_horizon_correlation,
+    trend_accuracy,
+    trend_accuracy_by_horizon,
+)
 from src.models.baselines import drift_forecast, persistence_forecast
 
 
@@ -63,3 +69,33 @@ def test_drift_baseline_beats_persistence_on_increasing_series_trend():
     assert pred_drift.shape == Y.shape
     assert np.isfinite(pred_drift).all()
     assert trend_d > trend_p
+
+
+def test_per_horizon_metrics_lengths_ranges_and_finiteness():
+    y0 = np.array([1.0, 2.0, 3.0, 4.0], dtype=float)
+    y_true = np.array(
+        [
+            [1.2, 1.3, 1.4],
+            [2.1, 2.0, 2.4],
+            [3.0, 3.2, 3.6],
+            [4.2, 4.3, 4.1],
+        ],
+        dtype=float,
+    )
+    y_pred = np.array(
+        [
+            [1.1, 1.4, 1.5],
+            [2.0, 2.1, 2.5],
+            [3.1, 3.1, 3.4],
+            [4.0, 4.5, 4.0],
+        ],
+        dtype=float,
+    )
+
+    trend_h = trend_accuracy_by_horizon(y_true, y_pred, y0)
+    corr_h = correlation_by_horizon(y_true, y_pred)
+
+    assert len(trend_h) == y_true.shape[1]
+    assert len(corr_h) == y_true.shape[1]
+    assert all(np.isfinite(v) and 0.0 <= v <= 1.0 for v in trend_h)
+    assert all(np.isfinite(v) and -1.0 <= v <= 1.0 for v in corr_h)

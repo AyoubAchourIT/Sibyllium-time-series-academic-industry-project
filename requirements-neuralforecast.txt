@@ -1,0 +1,6 @@
+# Optional dependencies for experimental NeuralForecast models (NHITS/NBEATS/TiDE)
+# Install together with requirements.txt when using --experimental-neuralforecast
+neuralforecast>=1.7.0
+pytorch-lightning>=2.0.0
+optuna>=3.0.0
+ray>=2.0.0
