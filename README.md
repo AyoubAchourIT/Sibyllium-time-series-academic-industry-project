@@ -12,6 +12,10 @@ Les métriques principales sont :
 - `mean_correlation` : corrélation moyenne entre trajectoires réelles et prédites sur l'horizon.
 - `composite` : score combiné (trend + corrélation).
 
+Définition de `corr_basis` (dans `metrics.json`) :
+- `corr_basis=\"level\"` : `corr_by_horizon` et `mean_correlation` utilisent la corrélation sur les niveaux (`y`).
+- `corr_basis=\"delta\"` : `corr_by_horizon` et `mean_correlation` utilisent la corrélation sur les deltas (`y - y0`).
+
 Résultats agrégés (100 fichiers) :
 - `MACD` : trend=`0.6598`, corr=`0.2499`, composite=`0.4549`
 - `Stoch_K` : trend=`0.6778`, corr=`0.2562`, composite=`0.4670`
@@ -47,6 +51,12 @@ python -m src.train --limit-files 100 --target macd --model gbdt --delta-target
 
 # Stoch_K benchmark (GBDT + delta target)
 python -m src.train --limit-files 100 --target stoch_k --model gbdt --delta-target
+
+# Stoch_K benchmark (LightGBM + delta target)
+python -m src.train --data-dir datas --limit-files 300 --target stoch_k --model lightgbm --delta-target --lookback-lags 128
+
+# Stoch_K benchmark (XGBoost + delta target)
+python -m src.train --data-dir datas --limit-files 300 --target stoch_k --model xgboost --delta-target --lookback-lags 128
 ```
 
 ## Visualiser les métriques par horizon
@@ -59,6 +69,12 @@ python -m src.report.plot_horizon_metrics --run-dir runs/<RUN_ID>
 ```bash
 # Compare recent runs and export a summary CSV
 python -m src.report.summarize_runs --runs-dir runs --last 20
+
+# Diagnostic détaillé d'un run (alignement, métriques par horizon, par symbole)
+python -m src.report.diagnose_run --run-dir runs/<RUN_ID> --out runs/<RUN_ID>/diagnostics.json
+
+# Table de benchmark multi-runs (comparaison des modèles/runs)
+python -m src.report.benchmark_table --runs-dir runs --out runs/benchmark_table.csv
 ```
 
 ## Modèles expérimentaux

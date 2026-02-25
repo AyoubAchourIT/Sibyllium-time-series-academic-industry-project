@@ -21,7 +21,9 @@ from src.metrics.forecast import (
 )
 from src.models.baselines import drift_forecast, persistence_forecast
 from src.models.ensembles import average_ensemble
+from src.models.lightgbm_models import predict_multioutput_lightgbm, train_multioutput_lightgbm
 from src.models.sklearn_models import predict_multioutput, train_multioutput_gbdt
+from src.models.xgboost_models import predict_multioutput_xgboost, train_multioutput_xgboost
 
 TARGET_CHOICES = (
     "macd",
@@ -31,7 +33,7 @@ TARGET_CHOICES = (
     "stoch_d",
     "stoch_d_smooth",
 )
-STABLE_MODELS = {"gbdt", "dlinear"}
+STABLE_MODELS = {"gbdt", "dlinear", "lightgbm", "xgboost"}
 EXPERIMENTAL_MODELS = {"nhits", "nbeats", "tide", "ensemble_gbdt_nhits"}
 ALL_MODELS = STABLE_MODELS | EXPERIMENTAL_MODELS
 
@@ -47,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lookback-lags", type=int, default=64, help="Number of lag features (1..N) for GBDT")
     parser.add_argument("--delta-target", action="store_true", help="Train GBDT on target deltas (Y - y0)")
     parser.add_argument("--sweep", action="store_true", help="Run a small GBDT hyperparameter sweep")
-    parser.add_argument("--model", default="gbdt", help="Main model to train (stable: gbdt, dlinear)")
+    parser.add_argument("--model", default="gbdt", help="Main model to train (stable: gbdt, dlinear, lightgbm, xgboost)")
     parser.add_argument(
         "--experimental-neuralforecast",
         action="store_true",
@@ -83,15 +85,50 @@ def _roll_windows_from_lookback(lookback_lags: int) -> list[int]:
 
 
 def _evaluate(y_true: np.ndarray, y_pred: np.ndarray, y0: np.ndarray) -> dict[str, float]:
-    corr = mean_horizon_correlation(y_true, y_pred)
+    return _evaluate_with_corr_basis(y_true, y_pred, y0, use_delta_corr=False)
+
+
+def _safe_corr_1d(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.shape != b.shape or a.size == 0:
+        return 0.0
+    if np.std(a) == 0 or np.std(b) == 0:
+        return 0.0
+    c = float(np.corrcoef(a, b)[0, 1])
+    return c if np.isfinite(c) else 0.0
+
+
+def _corr_variants_by_horizon(y_true: np.ndarray, y_pred: np.ndarray, y0: np.ndarray) -> tuple[list[float], list[float]]:
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
+    yc = np.asarray(y0, dtype=float).reshape(-1)
+    corr_level = [_safe_corr_1d(yt[:, k], yp[:, k]) for k in range(yt.shape[1])]
+    dtrue = yt - yc.reshape(-1, 1)
+    dpred = yp - yc.reshape(-1, 1)
+    corr_delta = [_safe_corr_1d(dtrue[:, k], dpred[:, k]) for k in range(yt.shape[1])]
+    return corr_level, corr_delta
+
+
+def _evaluate_with_corr_basis(
+    y_true: np.ndarray, y_pred: np.ndarray, y0: np.ndarray, *, use_delta_corr: bool
+) -> dict[str, float]:
     trend_h = trend_accuracy_by_horizon(y_true, y_pred, y0)
-    corr_h = correlation_by_horizon(y_true, y_pred)
+    corr_level_h, corr_delta_h = _corr_variants_by_horizon(y_true, y_pred, y0)
+    corr_basis = "delta" if use_delta_corr else "level"
+    corr_h = corr_delta_h if use_delta_corr else corr_level_h
+    mean_corr = float(np.mean(corr_h)) if corr_h else 0.0
+    trend = float(trend_accuracy(y_true, y_pred, y0))
+    composite = float(0.5 * trend + 0.5 * mean_corr)
     return {
-        "trend_accuracy": float(trend_accuracy(y_true, y_pred, y0)),
-        "mean_correlation": float(corr),
-        "composite": float(composite_score(y_true, y_pred, y0)),
+        "trend_accuracy": trend,
+        "mean_correlation": mean_corr,
+        "composite": composite,
         "trend_by_horizon": [float(v) for v in trend_h],
         "corr_by_horizon": [float(v) for v in corr_h],
+        "corr_basis": corr_basis,
+        "corr_level_by_horizon": [float(v) for v in corr_level_h],
+        "corr_delta_by_horizon": [float(v) for v in corr_delta_h],
     }
 
 
@@ -369,8 +406,8 @@ def _run_gbdt_experiment(
     pred_drift = np.asarray(drift_all[split_idx:], dtype=float)
 
     metrics: dict[str, dict[str, float]] = {
-        "persistence": _evaluate(y_val_np, pred_persistence, y0_val_np),
-        "drift": _evaluate(y_val_np, pred_drift, y0_val_np),
+        "persistence": _evaluate_with_corr_basis(y_val_np, pred_persistence, y0_val_np, use_delta_corr=delta_target),
+        "drift": _evaluate_with_corr_basis(y_val_np, pred_drift, y0_val_np, use_delta_corr=delta_target),
     }
 
     pred_model_delta = None
@@ -382,8 +419,133 @@ def _run_gbdt_experiment(
     else:
         models = train_multioutput_gbdt(X_train, Y_train)
         pred_model = predict_multioutput(models, X_val)
-    metrics["gbdt"] = _evaluate(y_val_np, pred_model, y0_val_np)
+    metrics["gbdt"] = _evaluate_with_corr_basis(y_val_np, pred_model, y0_val_np, use_delta_corr=delta_target)
 
+    return {
+        "metrics": metrics,
+        "pred_model": np.asarray(pred_model, dtype=float),
+        "pred_model_delta": None if pred_model_delta is None else np.asarray(pred_model_delta, dtype=float),
+        "pred_persistence": pred_persistence,
+        "pred_drift": pred_drift,
+        "y_val": y_val_np,
+        "y0_val": y0_val_np,
+        "split_idx": split_idx,
+        "n_rows": n_rows,
+        "n_features": int(X_train.shape[1]),
+        "models": models,
+        "delta_target": bool(delta_target),
+    }
+
+
+def _run_lightgbm_experiment(
+    ds: dict[str, object],
+    *,
+    horizon: int,
+    delta_target: bool,
+) -> dict[str, object]:
+    """Train/evaluate baselines + LightGBM on a prebuilt tabular dataset."""
+    X_all = ds["X"]
+    Y_all = ds["Y"]
+    y0_all = ds["y0"]
+    drift_all = ds["drift_pred"]
+    assert isinstance(X_all, pd.DataFrame)
+    assert isinstance(Y_all, pd.DataFrame)
+    assert isinstance(y0_all, pd.Series)
+    n_rows = len(X_all)
+    if n_rows < 2:
+        raise SystemExit("Need at least 2 rows/windows to create train/validation split.")
+    split_idx = max(1, min(n_rows - 1, int(n_rows * 0.8)))
+
+    X_train, X_val = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
+    Y_train, Y_val = Y_all.iloc[:split_idx], Y_all.iloc[split_idx:]
+    y0_train_np = y0_all.iloc[:split_idx].to_numpy(dtype=float)
+    y0_val_np = y0_all.iloc[split_idx:].to_numpy(dtype=float)
+    y_val_np = Y_val.to_numpy(dtype=float)
+
+    pred_persistence = persistence_forecast(y0_val_np, horizon=horizon)
+    pred_drift = np.asarray(drift_all[split_idx:], dtype=float)
+    metrics: dict[str, dict[str, float]] = {
+        "persistence": _evaluate_with_corr_basis(y_val_np, pred_persistence, y0_val_np, use_delta_corr=delta_target),
+        "drift": _evaluate_with_corr_basis(y_val_np, pred_drift, y0_val_np, use_delta_corr=delta_target),
+    }
+
+    pred_model_delta = None
+    try:
+        if delta_target:
+            train_target = Y_train.to_numpy(dtype=float) - y0_train_np.reshape(-1, 1)
+            models = train_multioutput_lightgbm(X_train, train_target)
+            pred_model_delta = predict_multioutput_lightgbm(models, X_val)
+            pred_model = pred_model_delta + y0_val_np.reshape(-1, 1)
+        else:
+            models = train_multioutput_lightgbm(X_train, Y_train)
+            pred_model = predict_multioutput_lightgbm(models, X_val)
+    except ImportError as exc:
+        raise SystemExit("LightGBM requested but lightgbm is not installed. Install `pip install lightgbm`.") from exc
+
+    metrics["lightgbm"] = _evaluate_with_corr_basis(y_val_np, pred_model, y0_val_np, use_delta_corr=delta_target)
+    return {
+        "metrics": metrics,
+        "pred_model": np.asarray(pred_model, dtype=float),
+        "pred_model_delta": None if pred_model_delta is None else np.asarray(pred_model_delta, dtype=float),
+        "pred_persistence": pred_persistence,
+        "pred_drift": pred_drift,
+        "y_val": y_val_np,
+        "y0_val": y0_val_np,
+        "split_idx": split_idx,
+        "n_rows": n_rows,
+        "n_features": int(X_train.shape[1]),
+        "models": models,
+        "delta_target": bool(delta_target),
+    }
+
+
+def _run_xgboost_experiment(
+    ds: dict[str, object],
+    *,
+    horizon: int,
+    delta_target: bool,
+) -> dict[str, object]:
+    """Train/evaluate baselines + XGBoost on a prebuilt tabular dataset."""
+    X_all = ds["X"]
+    Y_all = ds["Y"]
+    y0_all = ds["y0"]
+    drift_all = ds["drift_pred"]
+    assert isinstance(X_all, pd.DataFrame)
+    assert isinstance(Y_all, pd.DataFrame)
+    assert isinstance(y0_all, pd.Series)
+    n_rows = len(X_all)
+    if n_rows < 2:
+        raise SystemExit("Need at least 2 rows/windows to create train/validation split.")
+    split_idx = max(1, min(n_rows - 1, int(n_rows * 0.8)))
+
+    X_train, X_val = X_all.iloc[:split_idx], X_all.iloc[split_idx:]
+    Y_train, Y_val = Y_all.iloc[:split_idx], Y_all.iloc[split_idx:]
+    y0_train_np = y0_all.iloc[:split_idx].to_numpy(dtype=float)
+    y0_val_np = y0_all.iloc[split_idx:].to_numpy(dtype=float)
+    y_val_np = Y_val.to_numpy(dtype=float)
+
+    pred_persistence = persistence_forecast(y0_val_np, horizon=horizon)
+    pred_drift = np.asarray(drift_all[split_idx:], dtype=float)
+    metrics: dict[str, dict[str, float]] = {
+        "persistence": _evaluate_with_corr_basis(y_val_np, pred_persistence, y0_val_np, use_delta_corr=delta_target),
+        "drift": _evaluate_with_corr_basis(y_val_np, pred_drift, y0_val_np, use_delta_corr=delta_target),
+    }
+
+    pred_model_delta = None
+    try:
+        if delta_target:
+            train_target = Y_train.to_numpy(dtype=float) - y0_train_np.reshape(-1, 1)
+            val_target = y_val_np - y0_val_np.reshape(-1, 1)
+            models = train_multioutput_xgboost(X_train, train_target, X_val, val_target)
+            pred_model_delta = predict_multioutput_xgboost(models, X_val)
+            pred_model = pred_model_delta + y0_val_np.reshape(-1, 1)
+        else:
+            models = train_multioutput_xgboost(X_train, Y_train, X_val, Y_val)
+            pred_model = predict_multioutput_xgboost(models, X_val)
+    except ImportError as exc:
+        raise SystemExit("XGBoost requested but xgboost is not installed. Install `pip install xgboost`.") from exc
+
+    metrics["xgboost"] = _evaluate_with_corr_basis(y_val_np, pred_model, y0_val_np, use_delta_corr=delta_target)
     return {
         "metrics": metrics,
         "pred_model": np.asarray(pred_model, dtype=float),
@@ -416,7 +578,7 @@ def main() -> int:
     args.model = str(args.model).lower()
     if args.model not in ALL_MODELS:
         raise SystemExit(
-            f"Unsupported --model '{args.model}'. Stable models: gbdt, dlinear. "
+            f"Unsupported --model '{args.model}'. Stable models: gbdt, dlinear, lightgbm, xgboost. "
             "Experimental: nhits, nbeats, tide, ensemble_gbdt_nhits (requires --experimental-neuralforecast)."
         )
     if args.model in EXPERIMENTAL_MODELS and not args.experimental_neuralforecast:
@@ -519,7 +681,7 @@ def main() -> int:
         print(f"Sweep results saved: {run_dir / 'sweep_results.csv'}")
         return 0
 
-    if args.model == "gbdt":
+    if args.model in {"gbdt", "lightgbm", "xgboost"}:
         ds = _assemble_tabular_dataset(args, selected_files)
         X_all = ds["X"]
         Y_all = ds["Y"]
@@ -563,6 +725,38 @@ def main() -> int:
         if pred_model_delta is not None:
             np.save(run_dir / "predictions_val_gbdt_delta.npy", pred_model_delta)
         n_features = int(result["n_features"])
+    elif args.model == "lightgbm":
+        result = _run_lightgbm_experiment(ds, horizon=args.horizon, delta_target=bool(args.delta_target))
+        pred_model = result["pred_model"]
+        pred_model_delta = result["pred_model_delta"]
+        pred_persistence = result["pred_persistence"]
+        pred_drift = result["pred_drift"]
+        y_val_np = result["y_val"]
+        y0_val_np = result["y0_val"]
+        split_idx = int(result["split_idx"])
+        n_rows = int(result["n_rows"])
+        metrics = result["metrics"]
+        np.save(run_dir / "predictions_val.npy", pred_model)
+        np.save(run_dir / "predictions_val_lightgbm.npy", pred_model)
+        if pred_model_delta is not None:
+            np.save(run_dir / "predictions_val_lightgbm_delta.npy", pred_model_delta)
+        n_features = int(result["n_features"])
+    elif args.model == "xgboost":
+        result = _run_xgboost_experiment(ds, horizon=args.horizon, delta_target=bool(args.delta_target))
+        pred_model = result["pred_model"]
+        pred_model_delta = result["pred_model_delta"]
+        pred_persistence = result["pred_persistence"]
+        pred_drift = result["pred_drift"]
+        y_val_np = result["y_val"]
+        y0_val_np = result["y0_val"]
+        split_idx = int(result["split_idx"])
+        n_rows = int(result["n_rows"])
+        metrics = result["metrics"]
+        np.save(run_dir / "predictions_val.npy", pred_model)
+        np.save(run_dir / "predictions_val_xgboost.npy", pred_model)
+        if pred_model_delta is not None:
+            np.save(run_dir / "predictions_val_xgboost_delta.npy", pred_model_delta)
+        n_features = int(result["n_features"])
     elif args.model == "dlinear":
         if n_rows < 2:
             raise SystemExit("Need at least 2 rows/windows to create train/validation split.")
@@ -574,8 +768,8 @@ def main() -> int:
         pred_persistence = persistence_forecast(y0_val_np, horizon=args.horizon)
         pred_drift = np.asarray(drift_all[split_idx:], dtype=float)
         metrics = {
-            "persistence": _evaluate(y_val_np, pred_persistence, y0_val_np),
-            "drift": _evaluate(y_val_np, pred_drift, y0_val_np),
+            "persistence": _evaluate_with_corr_basis(y_val_np, pred_persistence, y0_val_np, use_delta_corr=False),
+            "drift": _evaluate_with_corr_basis(y_val_np, pred_drift, y0_val_np, use_delta_corr=False),
         }
         try:
             from src.models.dlinear import predict_dlinear, train_dlinear
@@ -592,7 +786,7 @@ def main() -> int:
             lr=args.lr,
         )
         pred_model = predict_dlinear(model, X_val)
-        metrics["dlinear"] = _evaluate(y_val_np, pred_model, y0_val_np)
+        metrics["dlinear"] = _evaluate_with_corr_basis(y_val_np, pred_model, y0_val_np, use_delta_corr=False)
         np.save(run_dir / "predictions_val.npy", pred_model)
         np.save(run_dir / "predictions_val_dlinear.npy", pred_model)
         n_features = int(X_train.shape[1])
@@ -634,9 +828,9 @@ def main() -> int:
         meta_val = pd.DataFrame({"symbol": ["backtest"] * len(y0_val_np), "source_file": ["backtest"] * len(y0_val_np)})
 
         metrics = {
-            "persistence": _evaluate(y_val_np, pred_persistence, y0_val_np),
-            "drift": _evaluate(y_val_np, pred_drift, y0_val_np),
-            args.model: _evaluate(y_val_np, pred_model, y0_val_np),
+            "persistence": _evaluate_with_corr_basis(y_val_np, pred_persistence, y0_val_np, use_delta_corr=False),
+            "drift": _evaluate_with_corr_basis(y_val_np, pred_drift, y0_val_np, use_delta_corr=False),
+            args.model: _evaluate_with_corr_basis(y_val_np, pred_model, y0_val_np, use_delta_corr=False),
         }
         np.save(run_dir / "predictions_val.npy", pred_model)
         np.save(run_dir / f"predictions_val_{args.model}.npy", pred_model)
@@ -734,11 +928,11 @@ def main() -> int:
 
         pred_model = average_ensemble(pred_gbdt_match, pred_nhits, weight_a=0.5)
         metrics = {
-            "persistence": _evaluate(y_val_np, pred_persistence, y0_val_np),
-            "drift": _evaluate(y_val_np, pred_drift, y0_val_np),
-            "gbdt": _evaluate(y_val_np, pred_gbdt_match, y0_val_np),
-            "nhits": _evaluate(y_val_np, pred_nhits, y0_val_np),
-            "ensemble_gbdt_nhits": _evaluate(y_val_np, pred_model, y0_val_np),
+            "persistence": _evaluate_with_corr_basis(y_val_np, pred_persistence, y0_val_np, use_delta_corr=False),
+            "drift": _evaluate_with_corr_basis(y_val_np, pred_drift, y0_val_np, use_delta_corr=False),
+            "gbdt": _evaluate_with_corr_basis(y_val_np, pred_gbdt_match, y0_val_np, use_delta_corr=True),
+            "nhits": _evaluate_with_corr_basis(y_val_np, pred_nhits, y0_val_np, use_delta_corr=False),
+            "ensemble_gbdt_nhits": _evaluate_with_corr_basis(y_val_np, pred_model, y0_val_np, use_delta_corr=False),
         }
         np.save(run_dir / "predictions_val.npy", pred_model)
         np.save(run_dir / "predictions_val_gbdt.npy", pred_gbdt_match)
@@ -785,10 +979,11 @@ def main() -> int:
         "rows_total": int(n_rows),
         "rows_train": int(split_idx),
         "rows_val": int(n_rows - split_idx),
+        "val_fraction": (float(n_rows - split_idx) / float(n_rows)) if n_rows else None,
         "n_features": n_features,
         "file_summaries": ds["file_summaries"],
     }
-    if args.model == "gbdt":
+    if args.model in {"gbdt", "lightgbm", "xgboost"}:
         config["lags_count"] = len(ds["lags"])
         config["roll_windows"] = ds["roll_windows"]
 
